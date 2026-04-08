@@ -13,44 +13,53 @@ Servo claw_lift_servo;
 CytronMD left_motor(PWM_DIR, 5, 4);
 CytronMD right_motor(PWM_DIR, 6, 7);
 
-const int LIFT_SERVO = 10;
-const int CLAMP_SERVO = 9;
-
-const int LEFT2_IR_SENSOR = 18;
-const int LEFT1_IR_SENSOR = 17;
-const int CENTER_IR_SENSOR = 16;
-const int RIGHT1_IR_SENSOR = 15; 
-const int RIGHT2_IR_SENSOR = 14; 
+const int LIFT_SERVO_PIN = 9;
+const int CLAMP_SERVO_PIN = 10;
+const int LEFT_IR_SENSOR_PIN = 18;
+const int CENTER_IR_SENSOR_PIN = 16;
+const int RIGHT_IR_SENSOR_PIN = 14; 
 
 // Motor constants
-const int MAX_SPEED = 255;    // Maximum motor speed
-const int MIN_SPEED = 50;     // Minimum motor speed (ensures the robot moves instead of stalling)
-
-const int FORWARD_SPEED = 255; // Speed when moving forward 
-const int FULL_TURN_SPEED = 200; // Speed when turning
-const int SLIGHT_TURN_SPEED = 200; // Speed for the slower wheel for slight turns
-const int SLOW_FACTOR = 2;
+const int MAX_SPEED = 255; // We specified the max speed here to contrain the motor speed between the max and min
+const int MIN_SPEED = 60; // The minimum motor speed that doesn't stall the motors
+const int FORWARD_SPEED = 150; // Motor speed when moving straight forward 
+const int TURN_SPEED = 150; // Speed for the one wheel that spins when turning
 
 // Servo constants
 const int CLAW_UP_ANGLE = 0;
-const int CLAW_DOWN_ANGLE = 30;
-const int CLOSE_CLAW_ANGLE = 65;
-const int OPEN_CLAW_ANGLE = 110;
+const int CLAW_DOWN_ANGLE = 35;
+const int CLAW_CLOSE_ANGLE = 0;
+const int CLAW_OPEN_ANGLE = 110;
 
-// Variable initialization
-const int LOOP_DELAY = 0; // How long the loop waits before looping again
-int current_mode = 0; // Which stage in competition the rover is in
-// What direction rover will go when it can't detect the line
-int planned_turn_direction = 0; // (-2: full left, -1: slight left, 0: straight, 1: slight right, 2: full right)
+// Computer vision constants 
+const int FRAME_CENTER = 150; // The x-position that represents the center of the camera's view
+const float KP = 1.5; // Proportional gain for turning control (used for feedback)
+const int TURN_THRESHOLD = 60; // How close the object must be to the center before moving forward
+const int SLOW_DISTANCE = 75; // Width threshold at which the rover begins slowing down
+const int GRAB_DISTANCE_WIDTH = 109; // The width of the object in pixels inside the pixycam feed
+
+const int PIXYCAM_TRANSITION_DELAY = 150; // The delay when the rover switches from line following to pixycam
+const int CLOSE_TO_LIFT_DELAY = 200; // The delay after the claw closes to when the claw lifts up 
+
+// Debug variables
+const bool DEBUG_MODE = false; // Enables the serial monitor and debug prints
+
+// Line following variables
+int program_mode = 0; // Determines which algorithm the rover is running (0:line following, 1:object tracking, 2:off)
+int planned_turn_direction = 0; // What the rover will do when it can't detect the line (-1:turn left, 0:go forward, 1:turn right)
+
+// Object detection variables 
+bool within_range = false; // Whether the object is close enough to grab based on its width in the camera view
+int object_x = 0;
+int object_width = 0;
+bool aligned = false; 
 
 // Structures declarations
-struct IRValues // A collection of bools representing all the sensors output
+struct IRValues // A collection of bools representing all the sensors output, where (1:line detected, 0:line not found)
 {
-  bool left2;
-  bool left1;
+  bool left;
   bool center;
-  bool right1;
-  bool right2;
+  bool right;
 };
 
 // Function declarations
@@ -58,70 +67,71 @@ IRValues get_ir_values();
 void stop_motors();
 void move_rover_forward();
 void full_turn_rover(int direction);
-void slight_turn_rover(int direction);
 void plan_direction(IRValues& ir_values);
 void find_line();
 void line_following();
+void detect_object(); 
+void move_rover();
+void pixycam();
 
 
+// At the start of the program this code configures pins, attaches pins to servos, positions the claw and initializes the pixycam 
 void setup() 
 {
-  Serial.begin(9600);
-  Serial.println("Starting Program...");
+  if (DEBUG_MODE)
+  {
+    Serial.begin(115200); // Sets the baud rate for the serial monitor
+    Serial.println("Starting Program...");
+  }
 
-  // Setting pin modes
-  pinMode(LEFT2_IR_SENSOR, INPUT);
-  pinMode(LEFT1_IR_SENSOR, INPUT);
-  pinMode(CENTER_IR_SENSOR, INPUT);
-  pinMode(RIGHT1_IR_SENSOR, INPUT);
-  pinMode(RIGHT2_IR_SENSOR, INPUT);
+  // Setting the IR sensor pin as input
+  pinMode(LEFT_IR_SENSOR_PIN, INPUT);
+  pinMode(CENTER_IR_SENSOR_PIN, INPUT);
+  pinMode(RIGHT_IR_SENSOR_PIN, INPUT);
 
-  claw_clamp_servo.attach(CLAMP_SERVO);    // Attach the clamp servo 
-  claw_lift_servo.attach(LIFT_SERVO);    // Attach the lift servo motor 
+  // Attaching pins to servo objects
+  claw_clamp_servo.attach(CLAMP_SERVO_PIN); 
+  claw_lift_servo.attach(LIFT_SERVO_PIN); 
 
-  claw_clamp_servo.write(OPEN_CLAW_ANGLE);    // Opens the claw
-  claw_lift_servo.write(CLAW_DOWN_ANGLE);    // Tilts to down position
+  // Setting the claw to its initial position
+  claw_open_lower();
 
-  pixy.init();    // Initialize Pixy2 camera
+  // Initialize Pixy2 camera
+  pixy.init();
 }
 
+// Indefinitely checks which mode the program is in and runs their respective algorithm (0:line following, 1:object tracking, 2:off)
 void loop() 
 {
-  Serial.println("------------");
-  delay(LOOP_DELAY);
-  if (current_mode == 0)
+  // Prints a line to separate each iteration of prints 
+  debug_println("----------");
+
+  if (program_mode == 0)
   {
+    // Runs the line following algorithm
     line_following();
   }
-  else if (current_mode == 1) 
+  else if (program_mode == 1)
   {
-    // Pixy cam tracking
-  } 
-  else if (current_mode == 2)
-  {
-    // Grabbing and lifting can
+    // Runs the pixycam tracking algorithm
+    pixycam(); 
   } 
 }
 
-// Gets all the IR sensor data
+
+// Line following code
+
+// Reads and returns the IR sensor values where (1:line detected, 0:line not found)
 IRValues get_ir_values()
 {
   IRValues ir_values;
-  ir_values.left2 = digitalRead(LEFT2_IR_SENSOR);
-  ir_values.left1 = digitalRead(LEFT1_IR_SENSOR);
-  ir_values.center = digitalRead(CENTER_IR_SENSOR);
-  ir_values.right1 = digitalRead(RIGHT1_IR_SENSOR);
-  ir_values.right2 = digitalRead(RIGHT2_IR_SENSOR);
 
-  Serial.print(ir_values.left2);
-  Serial.print(" ");
-  Serial.print(ir_values.left1);
-  Serial.print(" ");
-  Serial.print(ir_values.center);
-  Serial.print(" ");
-  Serial.print(ir_values.right1);
-  Serial.print(" ");
-  Serial.println(ir_values.right2);
+  // Reads the IR sensor values
+  ir_values.left = digitalRead(LEFT_IR_SENSOR_PIN);
+  ir_values.center = digitalRead(CENTER_IR_SENSOR_PIN);
+  ir_values.right = digitalRead(RIGHT_IR_SENSOR_PIN);
+
+  debug_println((String) ir_values.left + " " + (String) ir_values.center + " " + (String) ir_values.right);
   return ir_values;
 }
 
@@ -130,98 +140,71 @@ void stop_motors()
 {
   left_motor.setSpeed(0);
   right_motor.setSpeed(0);
-  Serial.println("Stopped motors...");
+
+  debug_println("Stopped motors...");
 }
 
-// Runs the motor 
+// Moves the rover forward 
 void move_rover_forward()
 {
-  int motor_forward_speed = constrain(FORWARD_SPEED / SLOW_FACTOR, MIN_SPEED, MAX_SPEED);
+  // Ensures the motor foward speed is within the bounds of the minimum and maximum speed
+  int motor_forward_speed = constrain(FORWARD_SPEED, MIN_SPEED, MAX_SPEED);
 
-  left_motor.setSpeed(-motor_forward_speed);
+  left_motor.setSpeed(-motor_forward_speed); // The left motor is reversed since the motor setup is mirrored
   right_motor.setSpeed(motor_forward_speed);
-  Serial.println("Running motors forwards...");
+
+  debug_println("Running motors forwards...");
 }
 
-// Turns Rover
+// Turns the rover, by only turning one wheel so that the rover can pivot around a point
 void full_turn_rover(int direction)
 {
-  int motor_turn_speed = constrain(FULL_TURN_SPEED / SLOW_FACTOR, MIN_SPEED, MAX_SPEED);
+  // Ensures the motor turn speed is within the bounds of the minimum and maximum speed
+  int motor_turn_speed = constrain(TURN_SPEED, MIN_SPEED, MAX_SPEED);
 
-  if (direction < 0)
+  if (direction < 0) // Turn left
   {
-    left_motor.setSpeed(motor_turn_speed);
+    left_motor.setSpeed(0);
     right_motor.setSpeed(motor_turn_speed);
   }
-  else if (direction > 0)
+  else if (direction > 0) // Turn right
   {
     left_motor.setSpeed(-motor_turn_speed);
-    right_motor.setSpeed(-motor_turn_speed);
+    right_motor.setSpeed(0);
   }
-  Serial.println("Fully turning motors...");
+
+  debug_println("Fully turning motors...");
 }
 
-// Moves forwards and turns rover
-void slight_turn_rover(int direction)
-{
-  int motor_fast_turn_speed = constrain(FORWARD_SPEED / SLOW_FACTOR, MIN_SPEED, MAX_SPEED);
-  int motor_slow_turn_speed = constrain(SLIGHT_TURN_SPEED / SLOW_FACTOR, MIN_SPEED, MAX_SPEED);
-
-  if (direction < 0)
-  {
-    left_motor.setSpeed(-motor_slow_turn_speed);
-    right_motor.setSpeed(motor_fast_turn_speed);
-  }
-  else if (direction > 0)
-  {
-    left_motor.setSpeed(motor_fast_turn_speed);
-    right_motor.setSpeed(-motor_slow_turn_speed);
-  }
-  Serial.println("Slightly turning motors...");
-}
-
-// Prepares planned direction when IR sensor can't find the line
+// Prepares a direction for when IR sensor can't find the line
 void plan_direction(IRValues& ir_values)
 {
-  if (ir_values.left2)
+  if (ir_values.left) // Left and right come before center as the rover should priotize turning when the line is missing
   {
-    planned_turn_direction = -2;
+    planned_turn_direction = -1;
   }
-  else if (ir_values.right2)
+  else if (ir_values.right)
   {
-    planned_turn_direction = 2;
+    planned_turn_direction = 1;
   }
   else if (ir_values.center)
   {
     planned_turn_direction = 0;
   }
-  else if (ir_values.left1)
-  {
-    planned_turn_direction = -1;
-  }
-  else if (ir_values.right1)
-  {
-    planned_turn_direction = 1;
-  }
 }
 
-// Runs motors based on planned_turn_direction
+// Runs motors based on the planned turn direction
 void find_line()
 {
-  Serial.println("Finding line...");
+  debug_println("Finding line...");
 
-  switch (abs(planned_turn_direction))
+  if (abs(planned_turn_direction) == 1) // If planned_turn_direction is left or right
   {
-    case 2:
-      full_turn_rover(planned_turn_direction);
-      break;
-    
-    case 1:
-      slight_turn_rover(planned_turn_direction);
-      break;
-
-    default:
-      move_rover_forward();
+    full_turn_rover(planned_turn_direction); // Turns the rover in the planned direction
+  }
+  else
+  {
+    move_rover_forward();
   }
 }
 
@@ -231,33 +214,176 @@ void line_following()
   IRValues ir_values = get_ir_values();  
   plan_direction(ir_values);
 
-  if (ir_values.center && ir_values.left1 && ir_values.right1 && ir_values.left2 && ir_values.right2)
+  // If the IR sensor sees the end line
+  if (ir_values.center && ir_values.left && ir_values.right) 
   {
     stop_motors();
-    current_mode = 1;
+    delay(PIXYCAM_TRANSITION_DELAY);
+    program_mode = 1;
   }
-  else if (ir_values.left2)
+  // If the left IR sensor sees the line
+  else if (ir_values.left) 
   {
     full_turn_rover(-1);
   }
-  else if (ir_values.right2)
+  // If the right IR sensor sees the line
+  else if (ir_values.right) 
   {
     full_turn_rover(1);
   }
-  else if (ir_values.center)
+  // If only the center IR sensor sees the line
+  else if (ir_values.center) 
   {
     move_rover_forward();
   }
-  else if (ir_values.left1)
+  // If none of the IR sensor sees the line 
+  else 
   {
-    slight_turn_rover(-1);
+    find_line();
   }
-  else if (ir_values.right1)
+}
+
+
+// Pixycam code 
+
+// Detects the target object using the Pixy camera's color-connected components (CCC) mode.
+// Updates global variables: object_x (horizontal position) and object_width (apparent size).
+void detect_object()
+{
+  pixy.ccc.getBlocks(); // Fetch latest detected color blocks from Pixy camera
+
+  if (pixy.ccc.numBlocks > 0) // At least one object is visible
   {
-    slight_turn_rover(1);
+    // Store the x-position and width of the most prominent block (index 0)    
+    object_x = pixy.ccc.blocks[0].m_x;
+    object_width = pixy.ccc.blocks[0].m_width;
+
+    debug_println("Object detected:" + (String) pixy.ccc.blocks[0].m_width);
+  }
+  else // No objects detected in frame
+  {
+    // Reset position and width so the rover doesn't act on stale data
+    object_x = 0;
+    object_width = 0;
+    delay(200); // Brief pause before re-scanning to avoid rapid repeated checks
+
+    debug_println("No object detected.");
+  }
+}
+
+// Controls rover movement to centre on and approach the detected object.
+// Uses the horizontal error between the object and the frame centre to steer,
+// and object width as a proxy for distance.
+void move_rover()
+{ 
+  int error = object_x - FRAME_CENTER; // Positive = object is right of centre, negative = left
+  debug_println("Error:" + (String) error);
+
+  // If the object appears large enough, it's close enough to grab — stop and return
+  if (object_width >= GRAB_DISTANCE_WIDTH) 
+  {
+    debug_println("Object within range...");
+
+    within_range = true;
+    stop_motors();
+    return;
+  }
+
+  // Object is roughly centred — drive forward
+  if (abs(error) <= TURN_THRESHOLD)
+  {
+    aligned = true;
+    debug_println("Object centered...");
+    
+    if (pixy.ccc.blocks[0].m_width > SLOW_DISTANCE) {
+      // Object is close — reduce speed to avoid overshooting
+      debug_println("Slowing down...");
+      left_motor.setSpeed(-FORWARD_SPEED);
+      right_motor.setSpeed(FORWARD_SPEED);
+    } 
+    else 
+    {
+      // Object is still far — drive at higher speed
+      debug_println("Moving at full speed...");
+      left_motor.setSpeed(-MAX_SPEED/1.5);
+      right_motor.setSpeed(MAX_SPEED/1.5);
+    }
+  }
+  else // Object is off-centre — rotate in place to re-align
+  {
+    aligned = false;
+    int turn = constrain(KP * error, MIN_SPEED, MAX_SPEED);
+    if (error == -150)
+    {
+      // Object location is unknown — rock the rover to find the object
+      left_motor.setSpeed(-MAX_SPEED/3);
+      right_motor.setSpeed(-MAX_SPEED/3);
+      delay(100);
+      left_motor.setSpeed(MAX_SPEED/3);
+      right_motor.setSpeed(MAX_SPEED/3);
+      delay(200);
+    }
+    else if (error < 0)
+    {
+      // Object is to the left — turn left in place (both motors same direction)
+      left_motor.setSpeed(turn);
+      right_motor.setSpeed(turn);
+    }
+    else if (error > 0)
+    {
+      // Object is to the right — turn right in place (both motors same direction)
+      left_motor.setSpeed(-turn);
+      right_motor.setSpeed(-turn);
+    }
+  }
+}
+
+// Main Pixy camera state machine — called repeatedly in the control loop.
+// If the rover is within grabbing range AND an object is visible, grab it.
+// Otherwise, scan for the object and steer towards it.
+void pixycam() 
+{
+  if (within_range and pixy.ccc.numBlocks > 0) 
+  {
+    claw_close_lift(); // Conditions met — proceed to grab
+    program_mode = 2; // This results in nothing running in the loop, effectively shutting down the program
   }
   else
   {
-    find_line();
+    detect_object(); // Update object position/size from camera
+    move_rover(); // Steer and drive toward the object
+  }
+}
+
+
+// Claw functions
+
+// Opens and lowers the claw
+void claw_open_lower()
+{
+  claw_clamp_servo.write(CLAW_OPEN_ANGLE);
+  claw_lift_servo.write(CLAW_DOWN_ANGLE);
+}
+
+// Closes and lifts the claw
+void claw_close_lift()
+{
+  stop_motors();
+  claw_clamp_servo.write(CLAW_CLOSE_ANGLE);
+  delay(CLOSE_TO_LIFT_DELAY); // Delay is to ensure the claw is fully closed before lifting 
+  claw_lift_servo.write(0);
+
+  debug_println("Grabbing object...");
+}
+
+
+// Debug functions
+
+// Prints the message only if DEBUG_MODE is set to true
+void debug_println(String text)
+{
+  if (DEBUG_MODE)
+  {
+    Serial.println(text);
   }
 }
